@@ -1,14 +1,30 @@
-import sys,os
+import sys, os
 import numpy as np
 import torch
 import torch.nn as nn
-
+import pickle
 
 sys.path.insert(0, os.path.abspath(".."))
 
 from cocoa_emu import cocoa_config
 from cocoa_emu import nn_pca_emulator 
-from cocoa_emu.nn_emulator import Affine, ResBlock, ResBottle, DenseBlock, Attention, Transformer, True_Transformer, Better_Attention, Better_Transformer
+from cocoa_emu.nn_emulator import Affine, ResBlock, ResBottle, DenseBlock, True_Transformer, Better_Attention, Better_Transformer, Multi_Head_Attention, Linearized_Softmax_Attention
+from cocoa_emu.custom_attention import AttnLayer, split_res_trfs, double_attn_block
+
+from cocoa_emu.base_model import base_model_customizable
+
+from fast_transformers.attention import FullAttention, LinearAttention, ReformerAttention
+
+# cuda or cpu
+if torch.cuda.is_available():
+    device = 'cuda:0'
+else:
+    device = 'cpu'
+    torch.set_num_interop_threads(40) # Inter-op parallelism
+    torch.set_num_threads(40) # Intra-op parallelism
+
+print('Using device: ',device)
+
 
 if '--auto' in sys.argv:
     idx = sys.argv.index('--auto')
@@ -32,30 +48,65 @@ else:
 #                              #
 ################################
 
+
+###########################
+# TESTING DIFFERENT ATTNS #
+###########################
+model_params_dict = {"in_dim":12, "int_dim_res":256, "n_channels":32, \
+                     "int_dim_trf":1024, "out_dim":780, "n_heads":8,  \
+                    "att_type":"aft"}
+
+#att_types: "full", "lin", "lsh", "aft"
+
+#model = base_model_customizable(**model_params_dict)
+###################################################################
+
+#params:
+
+#===============================#
+
 in_dim=12
-# N_layers = 1
+N_layers = 1
 int_dim_res = 256
-n_channels = 32
-int_dim_trf = 1024
+n_channels_half = 13   # make sure n_channels is a factor of int_dim_trf//2
+n_channels = 39
+int_dim_trf = 780      # 1024
 out_dim = 780
+n_heads_half = 1
+n_heads = 6
+
+att = FullAttention()#CausalLinearAttention(int_dim_trf//n_channels)
 
 layers = []
 layers.append(nn.Linear(in_dim, int_dim_res))
 layers.append(ResBlock(int_dim_res, int_dim_res))
 layers.append(ResBlock(int_dim_res, int_dim_res))
 layers.append(ResBlock(int_dim_res, int_dim_res))
-# layers.append(ResBlock(int_dim_res, int_dim_res))
 layers.append(nn.Linear(int_dim_res, int_dim_trf))
-layers.append(Better_Attention(int_dim_trf, n_channels))
-layers.append(Better_Transformer(int_dim_trf, n_channels))
-layers.append(Better_Attention(int_dim_trf, n_channels))
-layers.append(Better_Transformer(int_dim_trf, n_channels))
-layers.append(Better_Attention(int_dim_trf, n_channels))
-layers.append(Better_Transformer(int_dim_trf, n_channels))
-layers.append(nn.Linear(int_dim_trf, out_dim))
+
 layers.append(Affine())
 
-model = nn.Sequential(*layers)
+res = nn.Sequential(*layers)
+
+model_file_path = '/home/grads/data/amritpal/cocoa_lsst_emu/emulator_output/split_model_testing/LRRRL'
+res.load_state_dict(torch.load(model_file_path, map_location=device))
+
+del layers
+
+layers = []
+
+layers.append(double_attn_block(int_dim_trf, n_channels_half, n_heads_half, att))
+#layers.append(double_attn_block(int_dim_trf, n_channels_half, n_heads, att))
+
+layers.append(AttnLayer(int_dim_trf, n_channels, n_heads, att))
+layers.append(Better_Transformer(int_dim_trf, n_channels))
+#layers.append(AttnLayer(int_dim_trf, n_channels, n_heads, att))
+#layers.append(Better_Transformer(int_dim_trf, n_channels))
+layers.append(nn.Linear(int_dim_trf, out_dim))
+
+trfs = nn.Sequential(*layers)
+
+model = split_res_trfs(res, trfs)
 
 #===============================#
 
@@ -73,7 +124,7 @@ file = sys.argv[2]
 i=0
 if "-f" in sys.argv:
     idx = sys.argv.index('-f')
-    dv_root = './projects/lsst_y1/emulator_output/chains/'
+    dv_root = '/home/grads/extra_data/evan/cosmic_shear_training_data/'
     for file in os.listdir(dv_root):
         if sys.argv[idx+1] in file:
             if 'samples' in file:
@@ -112,7 +163,7 @@ if probe=='cosmic_shear':
     start=0
     stop=780
     sample_dim=12
-    validation_root='./projects/lsst_y1/emulator_output/chains/train_t128'#'./projects/lsst_y1/emulator_output/chains/valid_post_T256_atplanck'
+    validation_root='/home/grads/extra_data/evan/cosmic_shear_training_data/train_t128'#'./projects/lsst_y1/emulator_output/chains/valid_post_T256_atplanck'
     # validation_root='./projects/lsst_y1/emulator_output/chains/valid_post_T64_atplanck'
     # validation_root='./projects/lsst_y1/emulator_output/chains/train_t256'
 elif probe=='3x2pt':
@@ -195,16 +246,6 @@ if True:
 
 print("Number of training points:  ", len(train_samples))
 print("Number of validation points:", len(validation_samples))
-
-# cuda or cpu
-if torch.cuda.is_available():
-    device = 'cuda:0'
-else:
-    device = 'cpu'
-    torch.set_num_interop_threads(40) # Inter-op parallelism
-    torch.set_num_threads(40) # Intra-op parallelism
-
-print('Using device: ',device)
     
 TS = torch.as_tensor(train_samples,dtype=torch.float)
 TDV = torch.as_tensor(train_data_vectors,dtype=torch.float)
@@ -216,9 +257,18 @@ emu = nn_pca_emulator(model,
                         evecs, device, reduce_lr=True,lr=1e-3,weight_decay=1e-3)
 
 #batch size default : 2500
-emu.train(TS, TDV, VS, VDV, batch_size=256,n_epochs=250)
+emu.train(TS, TDV, VS, VDV, batch_size=512, n_epochs=250)
 #emu.save(config.savedir + '/for_tables/'+str(config.probe)+'_nlayer_'+str(N_layers)+'_intdim_'+str(INT_DIM)+'_frac_'+str(dim_frac)) # Rename your model :)
-emu.save('./projects/lsst_y1/emulator_output/models/'+outpath)
+emu.save('./emulator_output/split_model_testing/'+outpath)
+
+#with open('./emulator_output/models/models_dict.pickle', 'rb') as f:
+#    models_dict = pickle.load(f)
+#
+#models_dict[outpath] = model_params_dict
+#
+#with open('./emulator_output/models/models_dict.pickle', 'wb') as f:
+#    pickle.dump(models_dict, f, protocol = pickle.HIGHEST_PROTOCOL)
+
 print("DONE!!")   
 
 

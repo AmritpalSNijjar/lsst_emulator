@@ -7,10 +7,17 @@ import matplotlib.pyplot as plt
 import os
 import torch
 from torch import nn
+import pickle
 from cocoa_emu import cocoa_config, nn_pca_emulator
+from cocoa_emu.base_model import get_model
 from torchinfo import summary
 from datetime import datetime
 import sys
+
+
+from cocoa_emu.nn_emulator import Affine, ResBlock, ResBottle, DenseBlock, True_Transformer, Better_Attention, Better_Transformer, Multi_Head_Attention, Linearized_Softmax_Attention
+from cocoa_emu.custom_attention import AttnLayer, split_res_trfs, double_attn_block
+from fast_transformers.attention import FullAttention, LinearAttention, ReformerAttention
 
 def get_chi2(dv_predict, dv_exact, mask, cov_inv):
     delta_dv = (dv_predict - np.float32(dv_exact))[mask]
@@ -18,7 +25,7 @@ def get_chi2(dv_predict, dv_exact, mask, cov_inv):
     return chi2
 
 # adjust config
-configfile = './projects/lsst_y1/train_emulator.yaml'
+configfile = sys.argv[1]#'./projects/lsst_y1/train_emulator.yaml'
 config = cocoa_config(configfile)
 
 # validation samples
@@ -28,7 +35,9 @@ config = cocoa_config(configfile)
 
 # # T=128
 suffix = 1
-file = './projects/lsst_y1/emulator_output/chains/train_t128'
+file = '/home/grads/extra_data/evan/cosmic_shear_training_data/train_t128'
+#'./projects/lsst_y1/emulator_output/chains/train_t128'
+
 
 # T=64
 # suffix = 0
@@ -66,9 +75,10 @@ device=torch.device('cpu')
 torch.set_num_threads(1) # `Intra-op parallelism
 evecs=0
 
+
 # get list of trained emus
-#model_list = os.listdir('./projects/lsst_y1/emulator_output/models/new_trf/') #os.listdir('./projects/lsst_y1/emulator_output/models/for_tables/')
-model_list = [# 'T512_600k_tanh_lambda_10-3_Ntrf_1_Nres_3_bs_2500_lr_10-3',
+#os.listdir('./projects/lsst_y1/emulator_output/models/for_tables/')
+#model_list = [# 'T512_600k_tanh_lambda_10-3_Ntrf_1_Nres_3_bs_2500_lr_10-3',
               # 'T512_600k_relu_lambda_10-3_Ntrf_1_Nres_3_bs_2500_lr_10-3',
               # 'T512_600k_tanh_lambda_10-1_Ntrf_1_Nres_3_bs_2500_lr_10-3',
               # 'T512_600k_tanh_lambda_10-5_Ntrf_1_Nres_3_bs_2500_lr_10-3',
@@ -127,7 +137,7 @@ model_list = [# 'T512_600k_tanh_lambda_10-3_Ntrf_1_Nres_3_bs_2500_lr_10-3',
               # 'T512_600k_tanh_Nres3_Ntrf3_optimal',
               # 'T256_600k_tanh_optimal',
               # 'T256_1200k_tanh_optimal',
-              'T256_3000k_tanh_optimal',
+              # 'T256_3000k_tanh_optimal',
               # 'T128_600k_tanh_optimal',
               # 'T128_1200k_tanh_optimal',
               # 'T128_3000k_tanh_optimal',
@@ -144,18 +154,82 @@ model_list = [# 'T512_600k_tanh_lambda_10-3_Ntrf_1_Nres_3_bs_2500_lr_10-3',
               # 'baseline_relu_run3',
               # 'baseline_tanh_run_2',
               # 'baseline_tanh_run_3',
-]
+#]
 
 results = []
 
-for model in model_list:
+models_folder = '/home/grads/data/amritpal/cocoa_lsst_emu/emulator_output/split_model_testing/'
+model_list = os.listdir(models_folder) 
+
+
+for model in ['split_LRRRL22AL_13hf39ch']:
     # open the trained emulator
     if '.h5' in model:
         continue # these files are not emulators
-
+    if 'models_dict' in model:
+        continue # ignore file models_dict.pickle and models_dict script(s)
+    if '.ipynb' in model:
+        continue # ignore .ipynb checkpoints.            # REMOVE THIS FILE MANUALLY AT GET RID OF THIS LINE
+    if '__pycache__' in model:
+        continue # ignore whatever this is.              # REMOVE THIS FILE MANUALLY AT GET RID OF THIS LINE
+        
+    
     print(model)
-    emu_cs = nn_pca_emulator(nn.Sequential(nn.Linear(1,1)), config.dv_fid, 0, cov_inv_masked, evecs, device=device)
-    emu_cs.load('./projects/lsst_y1/emulator_output/models/'+model)
+    
+    # if using model_params_dict
+    #emu_cs = nn_pca_emulator(get_model(model), config.dv_fid, 0, cov_inv_masked, evecs, device=device)
+    
+    #===============================#
+    
+    in_dim=12
+    N_layers = 1
+    int_dim_res = 256
+    n_channels_half = 13   # make sure n_channels is a factor of int_dim_trf//2
+    n_channels = 39
+    int_dim_trf = 780      # 1024
+    out_dim = 780
+    n_heads = 1
+
+    att = FullAttention()#CausalLinearAttention(int_dim_trf//n_channels)
+
+    layers = []
+    layers.append(nn.Linear(in_dim, int_dim_res))
+    layers.append(ResBlock(int_dim_res, int_dim_res))
+    layers.append(ResBlock(int_dim_res, int_dim_res))
+    layers.append(ResBlock(int_dim_res, int_dim_res))
+    layers.append(nn.Linear(int_dim_res, int_dim_trf))
+
+    layers.append(Affine())
+
+    res = nn.Sequential(*layers)
+
+    model_file_path = '/home/grads/data/amritpal/cocoa_lsst_emu/emulator_output/split_model_testing/LRRRL'
+    res.load_state_dict(torch.load(model_file_path, map_location=device))
+
+    del layers
+
+    layers = []
+
+    layers.append(double_attn_block(int_dim_trf, n_channels_half, n_heads, att))
+    layers.append(double_attn_block(int_dim_trf, n_channels_half, n_heads, att))
+
+    layers.append(AttnLayer(int_dim_trf, n_channels, n_heads, att))
+    layers.append(Better_Transformer(int_dim_trf, n_channels))
+    #layers.append(AttnLayer(int_dim_trf, n_channels, n_heads, att))
+    #layers.append(Better_Transformer(int_dim_trf, n_channels))
+    layers.append(nn.Linear(int_dim_trf, out_dim))
+
+    trfs = nn.Sequential(*layers)
+
+    model_struct = split_res_trfs(res, trfs)
+
+    #===============================#
+    
+    emu_cs = nn_pca_emulator(model_struct, config.dv_fid, 0, cov_inv_masked, evecs, device=device)
+    
+    # DOUBLE CHECK LOAD LOCATION!!!
+    
+    emu_cs.load(models_folder + model, state_dict = True)
     print('emulator(s) loaded\n')
 
     chi2_list=np.zeros(len(samples_validation))
@@ -206,4 +280,4 @@ for model in model_list:
     print('numer of points chi2>1 {}'.format(count_1))
     print('numer of points chi2>0.2 {}\n'.format(count_2))
     
-    np.savetxt('delta_chi2/'+model+'.txt',chi2_list)
+    # np.savetxt('delta_chi2/'+model+'.txt',chi2_list)

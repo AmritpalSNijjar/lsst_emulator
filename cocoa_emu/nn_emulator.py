@@ -9,6 +9,9 @@ import sys
 from torchinfo import summary
 from datetime import datetime
 
+from fast_transformers.builders import AttentionBuilder
+
+
 class Affine(nn.Module):
     def __init__(self):
         super(Affine, self).__init__()
@@ -103,54 +106,15 @@ class DenseBlock(nn.Module):
         o     = torch.cat((o2,xskip),axis=1)
         return o
 
-class Attention(nn.Module):
-    def __init__(self, in_size ,n_partitions):
-        super(Attention, self).__init__()
-        self.embed_dim    = in_size//n_partitions
-        self.WQ           = nn.Linear(self.embed_dim,self.embed_dim)
-        self.WK           = nn.Linear(self.embed_dim,self.embed_dim)
-        self.WV           = nn.Linear(self.embed_dim,self.embed_dim)
-        self.act          = nn.Softmax(dim=2)
-        self.scale        = np.sqrt(self.embed_dim)
-        self.n_partitions = n_partitions
-        self.norm         = torch.nn.LayerNorm(in_size)#BatchNorm1d(in_size)
-
-    def forward(self, x):
-        batchsize = x.shape[0]
-        x_norm    = self.norm(x)
-
-        Q = torch.empty((batchsize,self.embed_dim,self.n_partitions))
-        K = torch.empty((batchsize,self.embed_dim,self.n_partitions))
-        V = torch.empty((batchsize,self.embed_dim,self.n_partitions))
-
-        # stack the input to find Q,K,V
-        for i in range(self.n_partitions):
-            qi = self.WQ(x_norm[:,i*self.embed_dim:(i+1)*self.embed_dim])
-            ki = self.WK(x_norm[:,i*self.embed_dim:(i+1)*self.embed_dim])
-            vi = self.WV(x_norm[:,i*self.embed_dim:(i+1)*self.embed_dim])
-
-            Q[:,:,i] = qi
-            K[:,:,i] = ki
-            V[:,:,i] = vi
-
-        # compute weighted dot product
-        dot_product = torch.bmm(Q,K.transpose(1, 2).contiguous())
-        normed_mat  = self.act(dot_product/self.scale)
-        prod        = torch.bmm(normed_mat,V)
-
-        #concat results of each head
-        out = torch.cat(tuple([prod[:,i] for i in range(self.embed_dim)]),dim=1)+x
-
-        return out
 
 class Better_Attention(nn.Module):
     def __init__(self, in_size ,n_partitions):
         super(Better_Attention, self).__init__()
 
         self.embed_dim    = in_size//n_partitions
-        self.WQ           = nn.Linear(self.embed_dim,self.embed_dim)
-        self.WK           = nn.Linear(self.embed_dim,self.embed_dim)
-        self.WV           = nn.Linear(self.embed_dim,self.embed_dim)
+        self.WQ           = nn.Linear(self.embed_dim, self.embed_dim)
+        self.WK           = nn.Linear(self.embed_dim, self.embed_dim)
+        self.WV           = nn.Linear(self.embed_dim, self.embed_dim)
 
         self.act          = nn.Softmax(dim=1) #NOT along the batch direction, apply to each vector.
         self.scale        = np.sqrt(self.embed_dim)
@@ -175,32 +139,116 @@ class Better_Attention(nn.Module):
 
         return out
 
-class Transformer(nn.Module):
-    def __init__(self, n_heads, int_dim):
-        super(Transformer, self).__init__()  
+##########################################################################################
+
+class Linearized_Softmax_Attention(nn.Module):
+    def __init__(self, in_size ,n_partitions):
+        super(Linearized_Softmax_Attention, self).__init__()
+
+        self.embed_dim    = in_size//n_partitions
+        self.WQ           = nn.Linear(self.embed_dim, self.embed_dim)
+        self.WK           = nn.Linear(self.embed_dim, self.embed_dim)
+        self.WV           = nn.Linear(self.embed_dim, self.embed_dim)
+        
+        self.phi          = nn.ELU()
+        
+        #self.act          = nn.Softmax(dim=1) #NOT along the batch direction, apply to each vector.
+        #self.scale        = np.sqrt(self.embed_dim)
+        self.n_partitions = n_partitions # n_partions or n_channels are synonyms 
+        self.norm         = torch.nn.LayerNorm(in_size) # layer norm has geometric order (https://lessw.medium.com/what-layernorm-really-does-for-attention-in-transformers-4901ea6d890e)
+
+    def forward(self, x):
+        x_norm    = self.norm(x)
+        batch_size = x.shape[0]
+        _x = x_norm.reshape(batch_size,self.n_partitions,self.embed_dim) # put into channels
+
+        # phi(x) generally acts on a row (q_i/k_i), so when using a phi kernel that requires the entire row
+        # specify dim = -1 via self.phi(x, dim = -1)
+        
+        Q = self.phi(self.WQ(_x)) + 1 # query with q_i as rows
+        K = self.phi(self.WK(_x)) + 1 # key   with k_i as rows
+        V = self.WV(_x) # value with v_i as rows
+        
+        
+        KV = torch.einsum("...ij,...ik->...kj", K, V)
+        Ksum = K.sum(dim = 1)
+        norm = 1/(torch.einsum("...ld,...d->...l",Q,Ksum)+1e-7)
+        prod = torch.einsum("...ld,...md,...l->...lm",Q,KV,norm)
+        
+        
+        #dot_product = torch.bmm(Q,K.transpose(1, 2).contiguous())
+        #normed_mat  = self.act(dot_product/self.scale)
+        #prod        = torch.bmm(normed_mat,V)
+        #prod        = torch.zeros_like(_x)
+        
+        #out = torch.cat(tuple([prod[:,i] for i in range(self.n_partitions)]),dim=1)+x
+        out = torch.reshape(prod,(batch_size,-1))+x # reshape back to vector
+
+        return out
     
-        self.int_dim     = int_dim
-        self.n_heads     = n_heads
-        self.module_list = nn.ModuleList([nn.Linear(int_dim,int_dim) for i in range(n_heads)])
-        self.act         = nn.Tanh()#nn.SiLU()
-        self.norm        = torch.nn.BatchNorm1d(int_dim*n_heads)
+##########################################################################################
 
-    def forward(self,x):
-        # init result array
-        batchsize = x.shape[0]
-        x_norm = self.norm(x)
-        results = torch.empty((batchsize,self.int_dim,self.n_heads))
+class Multi_Head_Attention(nn.Module):
+    def __init__(self, in_size, n_partitions, num_heads):
+        super(Multi_Head_Attention, self).__init__()
 
-        # do mlp for each head
-        for i,layer in enumerate(self.module_list):
-            o = x_norm[:,i*self.int_dim:(i+1)*self.int_dim]
-            o = self.act(layer(o))
-            results[:,:,i] = o
+        self.embed_dim    = in_size//n_partitions
+        self.num_heads    = num_heads
+        
+        self.WQ           = nn.Linear(self.embed_dim, self.embed_dim*self.num_heads)
+        self.WK           = nn.Linear(self.embed_dim, self.embed_dim*self.num_heads)
+        self.WV           = nn.Linear(self.embed_dim, self.embed_dim*self.num_heads)
+        self.WO           = nn.Linear(self.embed_dim*self.num_heads, self.embed_dim)
 
-        # concat heads
-        out = torch.cat(tuple([results[:,i] for i in range(self.int_dim)]),dim=1)
+        self.act          = nn.Softmax(dim = 2) #NOT along the batch direction, apply to each vector.
+        self.scale        = np.sqrt(self.embed_dim)
+        self.n_partitions = n_partitions # n_partions or n_channels are synonyms 
+        self.norm         = torch.nn.LayerNorm(in_size) # layer norm has geometric order (https://lessw.medium.com/what-layernorm-really-does-for-attention-in-transformers-4901ea6d890e)
 
-        return out+x
+    def forward(self, x):
+        x_norm    = self.norm(x)
+        batch_size = x.shape[0]
+        _x = x_norm.reshape(batch_size,self.n_partitions,self.embed_dim) # put into channels
+
+        quers = self.WQ(_x) # query with q_i as rows
+        keys = self.WK(_x) # key   with k_i as rows
+        vals = self.WV(_x) # value with v_i as rows
+        
+        ## SHAPE TRANSFORMATION
+        
+        quers = quers.reshape(quers.shape[0], quers.shape[1], self.num_heads, -1)
+        keys = keys.reshape(keys.shape[0], keys.shape[1], self.num_heads, -1)
+        vals = vals.reshape(vals.shape[0], vals.shape[1], self.num_heads, -1)
+        
+        quers = quers.permute(0, 2, 1, 3) #batch, num_heads, n_partitions, embed_dim
+        keys = keys.permute(0, 2, 1, 3)   #batch, num_heads, n_partitions, embed_dim
+        vals = vals.permute(0, 2, 1, 3)   #batch, num_heads, n_partitions, embed_dim
+
+        ## ATTENTION
+        dot_product = torch.einsum("...iq, ...jq->...ij", quers, keys) #Q.(K^T) batch, num_heads, n_partitions, n_partitions
+        
+        #dot_product = torch.bmm(Q,K.transpose(1, 2).contiguous())
+        normed_mat  = self.act(dot_product/self.scale)
+        prod        = torch.einsum("...ij, ...jk->...ik", normed_mat, vals) 
+        #(QKT).V [batch, num_heads, n_partitions, embed_dim]
+        
+        #torch.bmm(normed_mat,V) 
+        
+        ## UNDO SHAPE TRANSFORMATION
+        
+        prod = prod.permute(0, 2, 1, 3)
+        prod = prod.reshape(prod.shape[0], prod.shape[1], -1) #[batch, n_partitions, embed_dim*num_heads]
+        
+        out = self.WO(prod)
+        out = torch.reshape(out, (batch_size, -1)) + x
+
+        #out = torch.cat(tuple([prod[:,i] for i in range(self.n_partitions)]),dim=1)+x
+        #out = torch.reshape(prod,(batch_size,-1))+x # reshape back to vector
+
+        return out
+
+##########################################################################################
+
 
 class Better_Transformer(nn.Module):
     def __init__(self, in_size, n_partitions):
@@ -407,7 +455,7 @@ class nn_pca_emulator:
             f['dv_std'] = self.dv_std
             f['evecs']  = self.evecs
         
-    def load(self, filename, device=torch.device('cpu'),state_dict=False):
+    def load(self, filename, device=torch.device('cpu'), state_dict=False):
         self.trained = True
         if device!=torch.device('cpu'):
             torch.set_default_tensor_type('torch.cuda.FloatTensor')
