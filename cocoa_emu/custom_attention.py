@@ -8,7 +8,7 @@ from cocoa_emu.nn_emulator import Better_Transformer, Affine
 from fast_transformers.attention import FullAttention, LinearAttention, ReformerAttention, AFTFullAttention
 
 class AttnLayer(nn.Module):
-    def __init__(self, in_size, n_partitions, n_heads, att):
+    def __init__(self, in_size, n_partitions, n_heads, att, latent_dim = -1):
         super(AttnLayer, self).__init__()
         
         self.n_heads       = n_heads
@@ -27,9 +27,20 @@ class AttnLayer(nn.Module):
         
         self.layer         = AttentionLayer(att, self.d_model, n_heads, self.d_model, self.d_model)
         
-        self.WQ            = nn.Linear(self.d_model, self.d_model)
-        self.WK            = nn.Linear(self.d_model, self.d_model)
-        self.WV            = nn.Linear(self.d_model, self.d_model)
+        if latent_dim > 0:
+            self.WQ_down      = nn.Linear(self.latent_dim, self.d_model)
+            self.WQ_up        = nn.Linear(self.d_model, self.latent_dim)
+
+            self.WK_down      = nn.Linear(self.latent_dim, self.d_model)
+            self.WK_up        = nn.Linear(self.d_model, self.latent_dim)
+
+            self.WV_down      = nn.Linear(self.latent_dim, self.d_model)
+            self.WV_up        = nn.Linear(self.d_model, self.latent_dim)
+            
+        else:
+            self.WQ            = nn.Linear(self.d_model, self.d_model)
+            self.WK            = nn.Linear(self.d_model, self.d_model)
+            self.WV            = nn.Linear(self.d_model, self.d_model)
         
         self.attn_mask     = None
         self.query_lengths = None
@@ -50,9 +61,19 @@ class AttnLayer(nn.Module):
             self.query_lengths = FullMask(B, L, device=x.device) # Query Lengths (= n_partitions for all our data)
             self.key_lengths   = FullMask(B, L, device=x.device) # Key Lengths   (= n_partitions for all our data)
         
-        queries = self.WQ(_x)
-        keys = self.WK(_x)
-        values = self.WV(_x)
+        if latent_dim > 0:
+            Q_interim = self.WQ_down(_x)
+            queries = self.WQ_up(Q_interim)
+
+            K_interim = self.WK_down(_x)
+            keys = self.WK_up(K_interim)
+
+            V_interim = self.WV_down(_x)
+            values = self.WV_up(V_interim)
+        else:
+            queries = self.WQ(_x)
+            keys = self.WK(_x)
+            values = self.WV(_x)
         
         result = self.layer(queries, keys, values, self.attn_mask, self.query_lengths, self.key_lengths)
         
